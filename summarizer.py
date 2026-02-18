@@ -17,6 +17,7 @@ from config import (
     GEMINI_API_KEY, GEMINI_MODEL, GEMINI_MODEL_LITE, GEMINI_TIMEOUT,
     GEMINI_REQUEST_DELAY,
 )
+from moc_manager import scan_mocs, build_moc_catalog_text
 
 # ── 프롬프트 ──────────────────────────────────────────────────────────────────
 
@@ -51,8 +52,19 @@ ANALYSIS_PROMPT = """\
   "method": "연구 방법론 요약 (한국어)",
   "findings": ["1. 주요 발견1 (한국어)", "2. 주요 발견2", "3. 주요 발견3"],
   "excerpts": "아래 형식을 따르는 마크다운 문자열(한국어)\n### **논문 핵심 분석**\n#### **1. [핵심 주제 1]**\n- [원문 근거를 반영한 발췌/해설]\n#### **2. [핵심 주제 2]**\n- [원문 근거를 반영한 발췌/해설]\n### **요약 결론 (Executive Summary)**\n[실무적 시사점 중심 3~5문장 요약]",
-  "tags": ["태그1", "태그2", "태그3"]
+  "tags": ["태그1", "태그2", "태그3"],
+  "moc_assignments": [
+    {{"name": "MOC_주제명", "is_new": false}},
+    {{"name": "MOC_새주제", "is_new": true, "description": "새주제 관련 연구 허브"}}
+  ]
 }}
+
+MOC 분류 규칙:
+- 아래는 사용 가능한 기존 MOC 목록입니다:
+{moc_catalog}
+- 기존 MOC 중 이 논문에 적합한 것이 있으면 is_new: false로 선택 (1~3개)
+- 적합한 기존 MOC가 없으면 is_new: true로 새 MOC를 제안 (이름은 MOC_ 접두사 + 한국어 주제명)
+- 기존 MOC 목록이 비어있으면 자유롭게 새 MOC를 생성하세요
 
 논문 텍스트:
 {text}
@@ -233,6 +245,7 @@ def _fallback_summary(paper: dict) -> dict:
         "url": "",
         "language": "",
         "publisher": "",
+        "moc_assignments": [],
     }
 
 
@@ -297,10 +310,13 @@ def summarize_paper(paper: dict, biblio: dict | None = None) -> dict:
     full_text = paper.get("full_text", "")
     truncated = full_text[:MAX_TEXT_LENGTH]
 
-    # 3. Stage 2: preview 모델로 심층 분석
+    # 3. Stage 2: preview 모델로 심층 분석 (MOC 분류 포함)
+    # scan_mocs()는 디스크 I/O — 배치 처리 시에도 최신 상태 반영 위해 매번 호출
+    moc_catalog = build_moc_catalog_text(scan_mocs())
     raw2 = _call_gemini_model(
         ANALYSIS_PROMPT.format(
             title=title, author=author, year=year, journal=journal,
+            moc_catalog=moc_catalog,
             text=truncated,
         ),
         GEMINI_MODEL,

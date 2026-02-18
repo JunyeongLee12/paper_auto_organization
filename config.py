@@ -108,7 +108,7 @@ doi: {doi}
 
 ## 연결 (Links)
 - 관련 노트:
-- MOC: [[MOC_생성형AI]] | [[MOC_기업가정신]] | [[MOC_지식경영]]
+- MOC: {moc_links}
 
 ---
 **원본 파일**: [[{pdf_filename}]]

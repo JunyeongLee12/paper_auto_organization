@@ -6,6 +6,7 @@ from datetime import date
 from pathlib import Path
 
 from config import MARKDOWN_DIR, MARKDOWN_TEMPLATE
+from moc_manager import format_moc_links, create_new_moc, MOC_DIR
 
 
 def _sanitize_filename(name: str) -> str:
@@ -134,6 +135,24 @@ def generate_markdown(summary: dict, pdf_filename: str, zotero_key: str = "") ->
     base, ext = os.path.splitext(pdf_filename)
     safe_pdf_name = base + ".pdf"
 
+    # MOC 처리: AI가 제안한 moc_assignments를 파싱하여 링크 생성
+    moc_assignments = summary.get("moc_assignments", [])
+    moc_names = []
+    for moc in moc_assignments:
+        name = moc.get("name", "")
+        if not name:
+            continue
+        if not name.startswith("MOC_"):
+            name = f"MOC_{name}"
+        if moc.get("is_new"):
+            create_new_moc(name, moc.get("description", ""))
+        else:
+            # 기존 MOC 존재 여부 검증 — 없으면 자동 생성
+            if not (MOC_DIR / f"{name}.md").exists():
+                create_new_moc(name, moc.get("description", ""))
+        moc_names.append(name)
+    moc_links = format_moc_links(moc_names)
+
     content = MARKDOWN_TEMPLATE.format(
         title=yaml_title,
         year=year or "미상",
@@ -157,6 +176,7 @@ def generate_markdown(summary: dict, pdf_filename: str, zotero_key: str = "") ->
         findings=_to_numbered(summary.get("findings", "")),
         excerpts=_to_excerpts(summary.get("excerpts", "")),
         pdf_filename=safe_pdf_name,
+        moc_links=moc_links,
     )
 
     md_path.write_text(content, encoding="utf-8")
