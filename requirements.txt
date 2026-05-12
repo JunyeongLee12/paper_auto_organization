@@ -1,5 +1,4 @@
 PyMuPDF
 watchdog
 requests
-google-generativeai
 pyzotero

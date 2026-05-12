@@ -52,8 +52,14 @@ ZOTERO_STORAGE       = _require_path("ZOTERO_STORAGE", "Zotero storage 폴더 �
 ZOTERO_POLL_INTERVAL = int(os.getenv("ZOTERO_POLL_INTERVAL", "60"))   # 폴링 간격(초)
 ZOTERO_NOTE_SYNC     = os.getenv("ZOTERO_NOTE_SYNC", "true").lower() == "true"
 
-# ── Gemini API 설정 ────────────────────────────────────────
-GEMINI_API_KEY       = _require_env("GEMINI_API_KEY", "Google AI Studio에서 발급")
+# ── CrossRef 설정 ─────────────────────────────────────
+CROSSREF_MAILTO = _require_env("CROSSREF_MAILTO", "CrossRef Polite Pool 등록용 이메일")
+
+# ── Gemini 설정 ────────────────────────────────────────────
+# GEMINI_API_KEY 미설정(빈 문자열) 시 gemini CLI 구독 크레딧으로 자동 전환
+# - API 키 사용: .env에 GEMINI_API_KEY=... 입력
+# - CLI 구독 사용: GEMINI_API_KEY 비우거나 삭제 (@google/gemini-cli 설치·로그인 필요)
+GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL         = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")           # Stage 2: 심층 분석
 GEMINI_MODEL_LITE    = os.getenv("GEMINI_MODEL_LITE", "gemini-2.5-flash-lite")       # Stage 1: 서지정보 추출
 GEMINI_TIMEOUT       = int(os.getenv("GEMINI_TIMEOUT", "120"))         # seconds
@@ -92,8 +98,14 @@ doi: {doi}
 ## 핵심 주장 (Key Claims)
 {key_claims}
 
+## 연구 배경 (Research Background)
+{Research_Background}
+
 ## 연구 방법 (Method)
 {method}
+
+## 분석결과 (Analysis Result)
+{Analysis_Result}
 
 ## 주요 발견 (Findings)
 {findings}

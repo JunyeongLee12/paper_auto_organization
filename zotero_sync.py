@@ -25,9 +25,12 @@
 """
 
 import hashlib
+import html
 import json
+import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -77,6 +80,8 @@ class ZoteroSync:
         self.storage_dir = storage_dir
         self.state = self.load_state()
         self.obs_watcher = None  # ObsidianWatcher 참조 (충돌 방지용)
+        self._md_key_index: dict[str, Path] | None = None  # zotero_key → MD 경로 캐시
+        self._pdf_path_cache: dict[str, Path | None] = {}  # zotero_key → PDF 경로 캐시
 
     # ── 상태 관리 ──────────────────────────────────────────────────────────────
 
@@ -91,9 +96,18 @@ class ZoteroSync:
         return {"last_version": 0, "processed_keys": [], "processed_titles": []}
 
     def save_state(self):
-        """처리 상태를 파일에 저장."""
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, ensure_ascii=False, indent=2)
+        """처리 상태를 파일에 저장 (원자적 쓰기 — 비정상 종료 시 손상 방지)."""
+        fd, tmp = tempfile.mkstemp(dir=STATE_FILE.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, STATE_FILE)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
     # ── 새 아이템 감지 ─────────────────────────────────────────────────────────
 
@@ -113,7 +127,7 @@ class ZoteroSync:
 
         try:
             # since=버전 이후 변경된 아이템만 가져오기
-            items = self.zot.items(since=last_version, itemType="-attachment || note")
+            items = self.zot.items(since=last_version, itemType="-attachment || note || annotation")
         except Exception as e:
             print(f"  [오류] Zotero API 호출 실패: {e}")
             return []
@@ -136,7 +150,7 @@ class ZoteroSync:
             norm_title = _normalize_title(title)
 
             # attachment/note 제외
-            if item_type in ("attachment", "note"):
+            if item_type in ("attachment", "note", "annotation"):
                 continue
             # 학위논문 제외
             if item_type in skip_types:
@@ -167,16 +181,33 @@ class ZoteroSync:
 
     # ── PDF 경로 탐색 ──────────────────────────────────────────────────────────
 
-    def get_pdf_path(self, item_key: str) -> Path | None:
-        """Zotero 아이템의 로컬 PDF 경로를 반환.
+    def get_pdf_path(self, item_key: str, item: dict | None = None) -> Path | None:
+        """Zotero 아이템의 로컬 PDF 경로를 반환 (결과 캐시).
 
-        Zotero storage 구조: {storage_dir}/{attachment_key}/*.pdf
+        탐색 순서:
+          1. Zotero storage: {storage_dir}/{attachment_key}/*.pdf
+          2. attachment filename → PDF_DIR 직접 매칭
+          3. 아이템 제목 → PDF_DIR 파일명 유사도 매칭
         """
+        # 캐시 히트: 이미 탐색한 키는 재탐색하지 않음 (None 포함 캐시)
+        if item_key in self._pdf_path_cache:
+            return self._pdf_path_cache[item_key]
+
+        from config import PDF_DIR
+        import unicodedata
+
+        def _normalize(s: str) -> str:
+            """공백·특수문자 정규화 (한글 포함)."""
+            s = unicodedata.normalize("NFC", s)
+            return re.sub(r"[\s\-_:·,\.]+", " ", s).lower().strip()
+
         try:
             children = self.zot.children(item_key)
         except Exception as e:
             print(f"  [경고] children 조회 실패 ({item_key}): {e}")
             return None
+
+        pdf_filenames = []
 
         for child in children:
             child_data = child.get("data", {})
@@ -185,16 +216,55 @@ class ZoteroSync:
             if child_data.get("contentType") != "application/pdf":
                 continue
 
+            # 1순위: Zotero storage 탐색
             att_key = child.get("key", "")
             att_dir = self.storage_dir / att_key
+            if att_dir.exists():
+                pdf_files = list(att_dir.glob("*.pdf"))
+                if pdf_files:
+                    self._pdf_path_cache[item_key] = pdf_files[0]
+                    return pdf_files[0]
 
-            if not att_dir.exists():
-                continue
+            # attachment 파일명 수집
+            fname = child_data.get("filename") or child_data.get("title", "")
+            if fname and fname.lower().endswith(".pdf"):
+                pdf_filenames.append(fname)
 
-            pdf_files = list(att_dir.glob("*.pdf"))
-            if pdf_files:
-                return pdf_files[0]
+        # 2순위: attachment 파일명으로 PDF_DIR 직접 탐색
+        for fname in pdf_filenames:
+            candidate = PDF_DIR / fname
+            if candidate.exists():
+                self._pdf_path_cache[item_key] = candidate
+                return candidate
+            # 파일명 앞 60자로 glob
+            stem = Path(fname).stem[:60]
+            matches = list(PDF_DIR.glob(f"{stem}*.pdf"))
+            if matches:
+                self._pdf_path_cache[item_key] = matches[0]
+                return matches[0]
 
+        # 3순위: 아이템 제목으로 PDF_DIR 파일명 매칭
+        title = ""
+        if item:
+            title = item.get("data", {}).get("title", "")
+        if not title:
+            try:
+                meta = self.zot.item(item_key)
+                title = meta.get("data", {}).get("title", "")
+            except Exception:
+                pass
+
+        if title:
+            norm_title = _normalize(title)
+            # PDF_DIR 전체를 정규화 비교 (캐시 없이 — 파일 수 ~500개 수준)
+            for pdf_path in PDF_DIR.glob("*.pdf"):
+                norm_pdf = _normalize(pdf_path.stem)
+                # 제목 앞 20자가 파일명에 포함되거나, 파일명 앞 20자가 제목에 포함
+                if norm_title[:20] in norm_pdf or norm_pdf[:20] in norm_title:
+                    self._pdf_path_cache[item_key] = pdf_path
+                    return pdf_path
+
+        self._pdf_path_cache[item_key] = None
         return None
 
     # ── 서지정보 변환 ──────────────────────────────────────────────────────────
@@ -280,25 +350,29 @@ class ZoteroSync:
 
         def _list_html(value) -> str:
             if isinstance(value, list):
-                items = "".join(f"<li>{item}</li>" for item in value if item)
+                items = "".join(f"<li>{html.escape(str(item))}</li>" for item in value if item)
                 return f"<ul>{items}</ul>"
-            return f"<p>{value}</p>" if value else ""
+            return f"<p>{html.escape(str(value))}</p>" if value else ""
 
         def _text_html(value) -> str:
             if isinstance(value, list):
-                items = "".join(f"<li>{line}</li>" for line in value if line)
+                items = "".join(f"<li>{html.escape(str(line))}</li>" for line in value if line)
                 return f"<ul>{items}</ul>" if items else ""
             if not value:
                 return ""
             # 마크다운/줄바꿈이 섞인 문자열을 Zotero 노트에서 읽기 쉽도록 단락 분리
             blocks = [b.strip() for b in str(value).split("\n\n") if b.strip()]
-            return "".join(f"<p>{b.replace(chr(10), '<br>')}</p>" for b in blocks)
+            return "".join(f"<p>{html.escape(b).replace(chr(10), '<br>')}</p>" for b in blocks)
 
         note_html = (
             _h("h2", "핵심 주장")
             + _list_html(summary.get("key_claims", ""))
+            + _h("h2", "연구 배경")
+            + _text_html(summary.get("research_background", ""))
             + _h("h2", "연구 방법")
-            + f"<p>{summary.get('method', '')}</p>"
+            + _text_html(summary.get("method", ""))
+            + _h("h2", "분석결과")
+            + _text_html(summary.get("analysis_result", ""))
             + _h("h2", "주요 발견")
             + _list_html(summary.get("findings", ""))
             + _h("h2", "내용 발췌")
@@ -320,16 +394,28 @@ class ZoteroSync:
 
     # ── 기존 마크다운 서지정보 업데이트 ────────────────────────────────────────
 
-    def find_markdown_by_key(self, zotero_key: str) -> Path | None:
-        """zotero_key frontmatter로 마크다운 파일 탐색."""
+    def _build_md_key_index(self) -> dict[str, Path]:
+        """vault 전체를 스캔하여 zotero_key → MD 경로 인덱스 빌드."""
+        index: dict[str, Path] = {}
         for md_path in MARKDOWN_DIR.glob("@*.md"):
             try:
                 text = md_path.read_text(encoding="utf-8")
             except Exception:
                 continue
-            if f"zotero_key: {zotero_key}" in text:
-                return md_path
-        return None
+            m = re.search(r'^zotero_key:\s*([A-Z0-9]{8})\s*$', text, re.MULTILINE)
+            if m:
+                index[m.group(1)] = md_path
+        return index
+
+    def invalidate_md_key_index(self):
+        """새 마크다운 생성 후 인덱스 무효화."""
+        self._md_key_index = None
+
+    def find_markdown_by_key(self, zotero_key: str) -> Path | None:
+        """zotero_key frontmatter로 마크다운 파일 탐색 (인덱스 캐시 사용)."""
+        if self._md_key_index is None:
+            self._md_key_index = self._build_md_key_index()
+        return self._md_key_index.get(zotero_key)
 
     def update_existing_markdown(self, item: dict):
         """기존 마크다운의 서지정보 섹션만 업데이트. AI 분석 섹션은 보존."""
@@ -399,7 +485,7 @@ class ZoteroSync:
         print(f"\n[Zotero] 처리 중: {title[:60]}")
 
         # PDF 경로 탐색
-        pdf_path = self.get_pdf_path(key)
+        pdf_path = self.get_pdf_path(key, item=item)
         if pdf_path is None:
             print(f"  [경고] 로컬 PDF 없음 — 텍스트 없이 서지정보만 사용")
             paper = {"file_name": f"{key}.pdf", "full_text": "", "metadata": {}, "page_count": 0}
@@ -422,11 +508,18 @@ class ZoteroSync:
         pdf_filename = paper.get("file_name", f"{key}.pdf")
         md_path = generate_markdown(summary, pdf_filename, zotero_key=key)
 
+        if md_path is None:
+            print(f"  [경고] 마크다운 생성 실패 ({key}) — 재처리 가능하도록 상태 미기록")
+            return None
+
+        # 새 마크다운 생성 → MD 키 인덱스 무효화
+        self.invalidate_md_key_index()
+
         # 역방향: Zotero 노트 저장
         if ZOTERO_NOTE_SYNC:
             self.post_note(key, summary)
 
-        # 처리 완료 기록 (키 + 정규화 제목 모두 저장)
+        # 처리 완료 기록 (키 + 정규화 제목 모두 저장) — 성공한 경우에만
         self.state["processed_keys"].append(key)
         norm_title = _normalize_title(title)
         processed_titles: list = self.state.setdefault("processed_titles", [])
@@ -520,6 +613,8 @@ class ObsidianWatcher:
         if not key_m or not key_m.group(1).strip():
             return False
         zotero_key = key_m.group(1).strip()
+        if not re.fullmatch(r"[A-Z0-9]{8}", zotero_key):
+            return False
 
         # 태그 파싱
         tags_m = re.search(r'^tags:\s*\[(.+?)\]', fm, re.MULTILINE)

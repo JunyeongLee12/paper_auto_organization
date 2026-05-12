@@ -29,13 +29,11 @@ except ImportError:
     sys.exit(1)
 
 from config import (
+    CROSSREF_MAILTO,
     MARKDOWN_DIR,
     ZOTERO_API_KEY,
     ZOTERO_LIBRARY_ID,
 )
-
-# CrossRef Etiquette: mailto 헤더 포함
-CROSSREF_MAILTO = "paper-automation@example.com"
 CROSSREF_HEADERS = {
     "User-Agent": f"PaperOrganizer/1.0 (mailto:{CROSSREF_MAILTO})",
 }

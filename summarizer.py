@@ -8,7 +8,11 @@
 """
 
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 
 import requests
@@ -49,15 +53,35 @@ ANALYSIS_PROMPT = """\
 {{
   "abstract": "논문의 초록(Abstract) 전체를 원문 그대로 추출",
   "key_claims": ["핵심 주장1 (한국어)", "핵심 주장2", "핵심 주장3"],
+  "research_background": "연구 배경 및 선행연구 맥락 요약 (한국어, 3-5문장)",
   "method": "연구 방법론 요약 (한국어)",
+  "analysis_result": "분석 결과 요약 (한국어, 주요 수치/통계 포함)",
   "findings": ["1. 주요 발견1 (한국어)", "2. 주요 발견2", "3. 주요 발견3"],
   "excerpts": "아래 형식을 따르는 마크다운 문자열(한국어)\n### **논문 핵심 분석**\n#### **1. [핵심 주제 1]**\n- [원문 근거를 반영한 발췌/해설]\n#### **2. [핵심 주제 2]**\n- [원문 근거를 반영한 발췌/해설]\n### **요약 결론 (Executive Summary)**\n[실무적 시사점 중심 3~5문장 요약]",
-  "tags": ["태그1", "태그2", "태그3"],
+  "tags": ["topic/domain", "topic/domain/sub", "method/method", "specific-keyword1", "specific-keyword2"],
   "moc_assignments": [
     {{"name": "MOC_주제명", "is_new": false}},
     {{"name": "MOC_새주제", "is_new": true, "description": "새주제 관련 연구 허브"}}
   ]
 }}
+
+태그 생성 규칙 (반드시 준수):
+- 모든 태그는 영문만 사용 (한글 금지)
+- 계층 태그 (분류용, 반드시 포함):
+  * topic/ 예시: topic/entrepreneurship, topic/entrepreneurship/corporate, topic/entrepreneurship/digital,
+    topic/entrepreneurship/social, topic/entrepreneurship/education,
+    topic/knowledge-management, topic/knowledge-management/sharing, topic/knowledge-management/creation,
+    topic/knowledge-management/tacit, topic/knowledge-management/explicit,
+    topic/innovation, topic/innovation/open, topic/innovation/management,
+    topic/technology-management, topic/technology-management/ai-ml, topic/technology-management/digital-transformation,
+    topic/strategy, topic/sustainability, topic/education, topic/economics, topic/finance
+  * method/ 예시: method/sem, method/ml, method/topic-modeling, method/bibliometric,
+    method/network-analysis, method/systematic-review, method/meta-analysis,
+    method/case-study, method/qualitative, method/survey, method/quantitative, method/conceptual
+- 평탄 키워드 태그 (검색용): 논문의 핵심 이론·변수·구성개념을 kebab-case 영문으로 작성
+  예시: knowledge-sharing, dynamic-capabilities, seci-model, entrepreneurial-orientation,
+        firm-performance, mediating-effect, structural-holes, absorptive-capacity
+- 구성: topic 1~3개 + method 0~2개 + 키워드 5~10개 (총 8~15개)
 
 MOC 분류 규칙:
 - 아래는 사용 가능한 기존 MOC 목록입니다:
@@ -75,8 +99,14 @@ STAGE1_TEXT_LIMIT = 8000  # 서지정보 추출엔 앞부분으로 충분
 
 THESIS_KEYWORDS = ("학위", "석사", "박사", "thesis", "dissertation")
 
-# 모델별 가용 상태 캐시: None=미확인, True=정상, False=불가
+# 모델별 가용 상태 캐시: None=미확인, True=정상, False=불가 (REST API 모드용)
 _gemini_status: dict[str, bool | None] = {}
+
+# gemini CLI 바이너리 경로 캐시
+_GEMINI_CLI: str | None = shutil.which("gemini")
+
+# CLI 전역 가용 상태 (모델과 무관한 인증·바이너리 문제용)
+_cli_available: bool | None = None
 
 
 # ── 학위논문 감지 ─────────────────────────────────────────────────────────────
@@ -97,19 +127,82 @@ def is_thesis(paper: dict) -> bool:
     return any(kw in check_text for kw in THESIS_KEYWORDS)
 
 
-# ── Gemini API 호출 ───────────────────────────────────────────────────────────
+# ── Gemini 호출 ───────────────────────────────────────────────────────────────
+
+
+def _call_gemini_cli(prompt: str, model: str) -> str | None:
+    """Gemini CLI subprocess로 구독 크레딧 사용 (API 키 불필요).
+
+    공식 headless 모드(-p 플래그)를 사용하므로 Google ToS 준수.
+    프롬프트는 stdin으로 전달 — argv 노출 방지 및 OS 길이 제한 우회.
+    호출마다 독립 임시 디렉토리 — 프로젝트 컨텍스트 감지 차단.
+    -m 플래그 미사용 — CLI Auto(gemini 3) 사용, preview 모델 불안정 회피.
+    """
+    global _GEMINI_CLI, _cli_available
+
+    if _cli_available is False:
+        return None
+
+    if _GEMINI_CLI is None:
+        _GEMINI_CLI = shutil.which("gemini")
+    if _GEMINI_CLI is None:
+        print("  [오류] gemini CLI를 찾을 수 없습니다. PATH를 확인하세요.")
+        _cli_available = False
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = subprocess.run(
+                [_GEMINI_CLI, "-p", "", "-o", "text"],
+                input=prompt,          # stdin으로 전달 (argv 노출·길이 제한 회피)
+                capture_output=True,
+                text=True,
+                timeout=GEMINI_TIMEOUT,
+                cwd=tmpdir,            # 호출마다 격리된 임시 디렉토리
+                env={**os.environ, "GEMINI_CLI_TRUST_WORKSPACE": "true"},
+            )
+        if result.returncode == 0:
+            text = result.stdout.strip()
+            time.sleep(GEMINI_REQUEST_DELAY)
+            return text or None
+
+        stderr = result.stderr.lower()
+        if any(k in stderr for k in ("not logged in", "unauthenticated", "please run gemini auth")):
+            print("  [인증 오류] Gemini CLI 로그인 필요 — `gemini auth login` 실행하세요.")
+            _cli_available = False  # 세션 내 재시도 방지
+        elif any(k in stderr for k in ("capacity exhausted", "resource_exhausted", "503", "unavailable")):
+            print("  [용량 부족] Gemini CLI 일시 불가 — 다음 논문에서 재시도")
+            # 일시적 오류 — 캐시하지 않음
+        else:
+            print(f"  [CLI 오류] returncode={result.returncode}: {result.stderr[:300]}")
+        return None
+    except subprocess.TimeoutExpired:
+        print(f"  [시간초과] Gemini CLI {GEMINI_TIMEOUT}초 초과")
+        return None
+    except FileNotFoundError:
+        print("  [오류] gemini CLI를 찾을 수 없습니다. nvm PATH를 확인하세요.")
+        _cli_available = False
+        return None
+    except Exception as e:
+        print(f"  [오류] Gemini CLI 호출 실패: {e}")
+        return None
 
 
 def _call_gemini_model(prompt: str, model: str) -> str | None:
-    """특정 Gemini 모델로 REST API 호출. 영구 오류 또는 Rate Limit 시 None 반환."""
-    global _gemini_status
+    """특정 Gemini 모델로 호출. API 키 미설정 시 CLI 구독 모드로 자동 전환."""
+    global _gemini_status, _cli_available
 
+    # API 키 없으면 CLI 구독 모드 (_cli_available로 short-circuit)
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "여기에_API_키_입력":
+        if _cli_available is False:
+            return None
+        return _call_gemini_cli(prompt, model)
+
+    # REST API 모드: 모델별 상태 캐시
     if _gemini_status.get(model) is False:
         return None
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "여기에_API_키_입력":
-        _gemini_status[model] = False
-        return None
 
+    # REST API 모드 (API 키 있을 때)
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={GEMINI_API_KEY}"
@@ -134,9 +227,8 @@ def _call_gemini_model(prompt: str, model: str) -> str | None:
         return text
 
     except requests.ConnectionError:
-        if _gemini_status.get(model) is None:
-            print(f"  [경고] Gemini({model}) 연결 실패.")
-        _gemini_status[model] = False
+        # 일시적 네트워크 오류 — 영구 비활성화하지 않고 이번 호출만 실패 처리
+        print(f"  [경고] Gemini({model}) 일시적 연결 실패 (다음 논문에서 재시도).")
         return None
     except KeyError:
         print(f"  [경고] Gemini({model}) 응답 파싱 실패.")
@@ -232,7 +324,9 @@ def _fallback_summary(paper: dict) -> dict:
         "journal": meta.get("subject", ""),
         "abstract": abstract or "[초록을 추출할 수 없습니다. 원본 PDF를 확인하세요.]",
         "key_claims": "> [논문을 읽고 핵심 주장을 정리하세요]\n\n-",
+        "research_background": "> [연구 배경을 정리하세요]\n\n-",
         "method": "> [연구 방법론을 정리하세요]\n\n-",
+        "analysis_result": "> [분석 결과를 정리하세요]\n\n-",
         "findings": "> [주요 연구 결과를 정리하세요]\n\n1.\n2.\n3.",
         "excerpts": excerpts,
         "tags": [],
@@ -260,8 +354,8 @@ def summarize_paper(paper: dict, biblio: dict | None = None) -> dict:
                 {'title', 'author', 'year', 'journal', 'abstract', 'tags', ...}
 
     Returns:
-        {title, author, year, journal, abstract, key_claims, method,
-         findings, excerpts, tags}
+        {title, author, year, journal, abstract, key_claims,
+         research_background, method, analysis_result, findings, excerpts, tags}
     """
     fallback = _fallback_summary(paper)
 

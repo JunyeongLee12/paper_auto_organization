@@ -4,11 +4,17 @@
 AI가 제안한 새 MOC를 자동 생성한다.
 """
 
+import re
+import time
 from pathlib import Path
 
 from config import MARKDOWN_DIR
 
 MOC_DIR = MARKDOWN_DIR.parent / "04-Structure"
+
+_MOC_CACHE: dict[str, str] = {}
+_MOC_CACHE_TIME: float = 0.0
+_MOC_CACHE_TTL = 60.0  # 60초 TTL — 배치 처리 중 반복 I/O 방지, 새 MOC 생성 후 반영
 
 
 def scan_mocs() -> dict[str, str]:
@@ -16,7 +22,14 @@ def scan_mocs() -> dict[str, str]:
 
     설명은 파일 첫 번째 비어있지 않은 본문 줄(# 제목 제외)에서 추출.
     MOC 파일이 없으면 빈 dict 반환.
+    TTL 60초 캐시 적용 — 배치 처리 시 반복 디스크 I/O 방지.
     """
+    global _MOC_CACHE, _MOC_CACHE_TIME
+
+    now = time.monotonic()
+    if _MOC_CACHE and now - _MOC_CACHE_TIME < _MOC_CACHE_TTL:
+        return _MOC_CACHE
+
     if not MOC_DIR.exists():
         return {}
 
@@ -35,6 +48,9 @@ def scan_mocs() -> dict[str, str]:
         except Exception:
             pass
         mocs[name] = description
+
+    _MOC_CACHE = mocs
+    _MOC_CACHE_TIME = now
     return mocs
 
 
@@ -73,6 +89,11 @@ def create_new_moc(name: str, description: str = "") -> Path:
     if not name.startswith("MOC_"):
         name = f"MOC_{name}"
 
+    # Windows/Linux 파일명 불가 문자 제거 (LLM 출력 방어)
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip("_. ")
+    if not name or name == "MOC_":
+        name = "MOC_미분류"
+
     path = MOC_DIR / f"{name}.md"
     if path.exists():
         return path
@@ -103,4 +124,7 @@ def create_new_moc(name: str, description: str = "") -> Path:
 """
     path.write_text(content, encoding="utf-8")
     print(f"  [MOC] 새 MOC 생성: {name}")
+    # 새 MOC 생성 → 캐시 무효화
+    global _MOC_CACHE_TIME
+    _MOC_CACHE_TIME = 0.0
     return path

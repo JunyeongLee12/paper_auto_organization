@@ -7,8 +7,8 @@
   4. obsidian_to_zotero.py parse_body 버그 수정 확인
 
 사용법:
-  python3 repair_zotero.py --dry-run   # 변경 없이 분석만
-  python3 repair_zotero.py             # 실제 수정
+  python3 repair_zotero.py             # 기본: dry-run
+  python3 repair_zotero.py --apply     # 실제 수정(삭제 단계는 추가 확인 필요)
 """
 
 import argparse
@@ -295,16 +295,27 @@ def fix_authors(zot, all_items, key_to_md, json_papers, dry_run):
 
 def main():
     parser = argparse.ArgumentParser(description="Zotero 데이터 품질 수정")
-    parser.add_argument("--dry-run", action="store_true", help="분석만, 실제 변경 없음")
+    parser.add_argument("--dry-run", action="store_true", default=True,
+                        help="분석만 수행 (기본 동작)")
+    parser.add_argument("--apply", action="store_true",
+                        help="실제 변경 수행 (--confirm-delete 없으면 삭제 단계는 건너뜀)")
+    parser.add_argument("--confirm-delete", action="store_true",
+                        help="1단계 삭제를 실제로 수행할 때 필요한 추가 확인 플래그")
     args = parser.parse_args()
+    dry_run = not args.apply
 
+    print("[위험] 로컬 MD 없음 = Zotero 삭제 정책. vault가 완전한 상태인지 반드시 확인하세요.")
     if not ZOTERO_LIBRARY_ID or not ZOTERO_API_KEY:
         print("[오류] Zotero 설정 없음")
         sys.exit(1)
 
     print("=" * 60)
-    print(f"Zotero 데이터 수정 {'[DRY-RUN]' if args.dry_run else ''}")
+    print(f"Zotero 데이터 수정 {'[DRY-RUN]' if dry_run else '[APPLY]'}")
     print("=" * 60)
+    if dry_run:
+        print("[안내] --apply가 없으므로 dry-run 모드로만 실행합니다.")
+    elif not args.confirm_delete:
+        print("[경고] --apply만 지정되었습니다. 1단계 삭제는 --confirm-delete가 있어야 실행됩니다.")
 
     zot = zotero.Zotero(ZOTERO_LIBRARY_ID, "user", ZOTERO_API_KEY)
 
@@ -317,12 +328,30 @@ def main():
     print(f"  마크다운 파일: {len(key_to_md)}개")
 
     # 1단계: 중복 삭제
-    delete_duplicates(zot, all_items, key_to_md, args.dry_run)
+    delete_candidates = [item for item in all_items if item["key"] not in key_to_md]
+    if dry_run:
+        delete_duplicates(zot, all_items, key_to_md, True)
+    elif not args.confirm_delete:
+        print(f"\n[1단계] 중복 아이템 삭제: {len(delete_candidates)}개")
+        print("  [SKIP] --confirm-delete 없이 삭제 단계 건너뜀")
+    else:
+        proceed_delete = True
+        if len(delete_candidates) >= 10:
+            expected = f"DELETE {len(delete_candidates)}"
+            try:
+                typed = input(f"[확인 필요] 삭제 대상 {len(delete_candidates)}개. 진행하려면 정확히 '{expected}' 입력: ").strip()
+            except EOFError:
+                typed = ""
+            if typed != expected:
+                print("  [SKIP] 확인 문자열 불일치로 삭제 단계 건너뜀")
+                proceed_delete = False
+        if proceed_delete:
+            delete_duplicates(zot, all_items, key_to_md, False)
 
     # 2단계: 저자 수정
     # 삭제 후 남은 아이템만 대상
     remaining = [item for item in all_items if item["key"] in key_to_md]
-    fix_authors(zot, remaining, key_to_md, json_papers, args.dry_run)
+    fix_authors(zot, remaining, key_to_md, json_papers, dry_run)
 
     print("\n완료!")
 

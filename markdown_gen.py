@@ -38,18 +38,24 @@ def _build_filename(summary: dict) -> str:
 
 
 def _format_tags_yaml(tags: list[str]) -> str:
-    """YAML frontmatter용 태그 문자열: literature, paper, tag1, tag2"""
-    base = ["literature", "paper"]
+    """YAML frontmatter용 태그 문자열: type/paper + 계층/키워드 태그."""
+    from normalize_tags import HIERARCHY_MAP, _sort_tags
+    base = ["type/paper"]
     extra = [t.lower().replace(" ", "-") for t in tags if t]
-    all_tags = base + [t for t in extra if t not in base]
+    # flat 영문 → 계층 변환
+    converted = [HIERARCHY_MAP.get(t, t) for t in extra]
+    all_tags = _sort_tags(base + [t for t in converted if t not in base])
     return ", ".join(all_tags)
 
 
 def _format_hashtags(tags: list[str]) -> str:
-    """본문용 해시태그: #tag1 #tag2"""
+    """본문용 해시태그: type/ 제외, #topic/... #method/... #keyword."""
+    from normalize_tags import HIERARCHY_MAP, _sort_tags
     if not tags:
         return ""
-    return " ".join(f"#{t.lower().replace(' ', '-')}" for t in tags if t)
+    converted = [HIERARCHY_MAP.get(t.lower().replace(" ", "-"), t.lower().replace(" ", "-")) for t in tags if t]
+    keyword_tags = [t for t in _sort_tags(converted) if not t.startswith("type/")]
+    return " ".join(f"#{t}" for t in keyword_tags)
 
 
 def _to_bullets(value) -> str:
@@ -115,14 +121,18 @@ def generate_markdown(summary: dict, pdf_filename: str, zotero_key: str = "") ->
         return None
 
     # 동일 연도+제목으로 시작하는 기존 파일이 있는지도 확인
+    # _build_filename과 동일한 로직으로 제목을 정규화해 정확 비교
     year = summary.get("year", "")
     if year:
         prefix = f"@{year}_"
         existing = list(MARKDOWN_DIR.glob(f"{prefix}*.md"))
-        title_part = _sanitize_filename(summary.get("title", ""))[:30]
+        title_full = _sanitize_filename(summary.get("title", ""))
+        if len(title_full) > 80:
+            title_full = title_full[:80].rsplit("-", 1)[0]
         for existing_file in existing:
-            if title_part and title_part.lower() in existing_file.name.lower():
-                print(f"  [스킵] 유사 파일 존재: {existing_file.name}")
+            existing_title = existing_file.stem[len(prefix):]
+            if title_full and existing_title.lower() == title_full.lower():
+                print(f"  [스킵] 동일 제목 파일 존재: {existing_file.name}")
                 return None
 
     tags = summary.get("tags", [])
@@ -172,7 +182,9 @@ def generate_markdown(summary: dict, pdf_filename: str, zotero_key: str = "") ->
         hashtags=_format_hashtags(tags),
         abstract=summary.get("abstract", ""),
         key_claims=_to_bullets(summary.get("key_claims", "")),
+        Research_Background=summary.get("research_background", ""),
         method=summary.get("method", ""),
+        Analysis_Result=summary.get("analysis_result", ""),
         findings=_to_numbered(summary.get("findings", "")),
         excerpts=_to_excerpts(summary.get("excerpts", "")),
         pdf_filename=safe_pdf_name,

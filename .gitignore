@@ -1,0 +1,24 @@
+# 환경 설정 (시크릿 포함 — 절대 커밋 금지)
+.env
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# 백업 파일 (재처리 안전장치)
+*.bak
+
+# 작업 상태/추출 데이터 (사용자별 로컬 데이터)
+batch_progress.json
+extracted_papers.json
+zotero_sync_state.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
